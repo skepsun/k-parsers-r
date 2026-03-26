@@ -12,7 +12,7 @@ jobs:
       - name: Checkout Upstream
         uses: actions/checkout@v4
         with:
-          repository: 'Kotatsu-Redo/kotatsu-parsers'
+          repository: 'Kotatsu-Redo/kotatsu-parsers-redo'
           path: 'upstream'
           
       - name: Checkout Deploy Branch
