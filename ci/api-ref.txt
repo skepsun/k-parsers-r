@@ -1,0 +1,7 @@
+# Parser API of the Kototoro client this plugin is built against.
+#
+# The plugin has to be compiled against the very API the client ships, otherwise the
+# client refuses to load it (MissingMethod / AbstractMethodError at load time).
+# Bump the commit whenever the client's parser-api changes; a stale pin shows up as a
+# CI failure in ci/verify_plugin.py, or at runtime as a NoSuchMethodError.
+Kototoro-app/Kototoro 3c5453159776093a20d980320007811a21700ec4

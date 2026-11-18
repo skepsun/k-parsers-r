@@ -8,38 +8,53 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: redo-plugin-release
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout Build Tooling
+        uses: actions/checkout@v4
+        with:
+          path: 'ci-repo'
+
       - name: Checkout Upstream
         uses: actions/checkout@v4
         with:
           repository: 'Kotatsu-Redo/kotatsu-parsers-redo'
           path: 'upstream'
-          
+
       - name: Poll Upstream Delta
         id: check_update
         run: |
-          cd upstream
-          UPSTREAM_COMMIT=$(git rev-parse HEAD)
-          echo "Upstream target: $UPSTREAM_COMMIT"
-          cd ..
-          
-          mkdir -p deploy
-          curl -s -f https://raw.githubusercontent.com/${{ github.repository }}/repo/upstream_commit.txt > deploy/upstream_commit.txt || echo "No existing deployment found on remote."
-          
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "Manual trigger detected, forcing rebuild."
-          elif [ -s "deploy/upstream_commit.txt" ]; then
-            LAST_COMMIT=$(cat deploy/upstream_commit.txt)
-            if [ "$UPSTREAM_COMMIT" == "$LAST_COMMIT" ]; then
-              echo "has_update=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
+          set -euo pipefail
+          UPSTREAM_COMMIT=$(git -C upstream rev-parse HEAD)
+          API_REF=$(grep -hv '^#' ci-repo/ci/api-ref.txt | grep -v '^[[:space:]]*$' | tail -1)
+          if [ -z "$API_REF" ]; then
+            echo "ci/api-ref.txt has no '<owner>/<repo> <commit>' line" >&2
+            exit 1
           fi
-          echo "has_update=true" >> $GITHUB_OUTPUT
+          echo "Upstream target: $UPSTREAM_COMMIT"
+          echo "Client parser api: $API_REF"
+
+          mkdir -p deploy
+          curl -s -f "https://raw.githubusercontent.com/${{ github.repository }}/repo/upstream_commit.txt" > deploy/upstream_commit.txt || true
+          curl -s -f "https://raw.githubusercontent.com/${{ github.repository }}/repo/compat_ref.txt" > deploy/compat_ref.txt || true
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger detected, forcing rebuild."
+          elif [ "$(cat deploy/upstream_commit.txt 2>/dev/null)" = "$UPSTREAM_COMMIT" ] \
+            && [ "$(cat deploy/compat_ref.txt 2>/dev/null)" = "$API_REF" ]; then
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has_update=true" >> "$GITHUB_OUTPUT"
           echo "UPSTREAM_COMMIT=$UPSTREAM_COMMIT" >> "$GITHUB_ENV"
+          echo "API_REF=$API_REF" >> "$GITHUB_ENV"
 
       - name: JDK 17
         if: steps.check_update.outputs.has_update == 'true'
@@ -47,31 +62,50 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-          
-      - name: Build Standard JAR
+
+      # Upstream moved the parsers onto "parsers-api v1" (the app owns the contract, parsers
+      # ship as a signed dex bundle). This client still loads the older plugin shape, so the
+      # parsers are compiled against the client's own parser api. See ci/api-ref.txt.
+      - name: Make Parsers Compile Against The Client API
+        if: steps.check_update.outputs.has_update == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 ci-repo/ci/make_compatible.py upstream --token "$GITHUB_TOKEN"
+
+      - name: Build JAR
         if: steps.check_update.outputs.has_update == 'true'
         run: |
+          chmod +x upstream/gradlew
           cd upstream
-          # Bytecode compatibility patch for Kototoro Native JVM Host
-          sed -i 's/public val source: MangaParserSource/public val source: MangaSource/g' src/main/kotlin/org/koitharu/kotatsu/parsers/MangaParser.kt
-          # API Retention Patch for Kototoro Broken Source Filter
-          sed -i 's/@Retention(AnnotationRetention.SOURCE)/@Retention(AnnotationRetention.RUNTIME)/g' src/main/kotlin/org/koitharu/kotatsu/parsers/Broken.kt
-          sed -i 's/internal annotation class Broken/public annotation class Broken/g' src/main/kotlin/org/koitharu/kotatsu/parsers/Broken.kt
-          sed -i 's/@Retention(AnnotationRetention.SOURCE)/@Retention(AnnotationRetention.RUNTIME)/g' src/main/kotlin/org/koitharu/kotatsu/parsers/MangaSourceParser.kt
-          sed -i 's/internal annotation class MangaSourceParser/public annotation class MangaSourceParser/g' src/main/kotlin/org/koitharu/kotatsu/parsers/MangaSourceParser.kt
-          chmod +x ./gradlew
           ./gradlew jar --no-daemon
-        
+
+      # Fails the run instead of publishing a plugin the client would load as zero sources.
+      - name: Verify Plugin ABI
+        if: steps.check_update.outputs.has_update == 'true'
+        run: |
+          JAR_FILE=$(ls upstream/build/libs/*.jar | grep -v -- '-contract\.jar$' | head -n 1)
+          echo "Verifying $JAR_FILE"
+          python3 ci-repo/ci/verify_plugin.py "$JAR_FILE" upstream
+
       - name: D8 Dex Engine Packaging
         if: steps.check_update.outputs.has_update == 'true'
         run: |
-          BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | tail -1)
+          set -euo pipefail
+          BUILD_TOOLS_DIR=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
           D8_PATH="$BUILD_TOOLS_DIR/d8"
           ANDROID_JAR="$ANDROID_HOME/platforms/android-34/android.jar"
+          if [ ! -f "$ANDROID_JAR" ]; then
+            ANDROID_JAR=$(ls "$ANDROID_HOME"/platforms/*/android.jar | sort -V | tail -1)
+          fi
+          echo "d8: $D8_PATH"
+          echo "android.jar: $ANDROID_JAR"
+
           cd upstream/build/libs
-          JAR_FILE=$(ls *.jar | head -n 1)
-          $D8_PATH --release --lib $ANDROID_JAR --output . $JAR_FILE
+          JAR_FILE=$(ls *.jar | grep -v -- '-contract\.jar$' | head -n 1)
+          echo "dexing $JAR_FILE"
+          "$D8_PATH" --release --lib "$ANDROID_JAR" --output . "$JAR_FILE"
           jar cvf plugin.jar classes.dex
+
           mkdir -p ../../../deploy_new/apk
           cp plugin.jar ../../../deploy_new/apk/
 
@@ -89,6 +123,7 @@ jobs:
           ]
           EOF
           echo "${{ env.UPSTREAM_COMMIT }}" > ../../../deploy_new/upstream_commit.txt
+          echo "${{ env.API_REF }}" > ../../../deploy_new/compat_ref.txt
 
       - name: Push to Repo Deploy Branch
         if: steps.check_update.outputs.has_update == 'true'
